@@ -14,7 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-"""Kimi K3 integration coverage for the PR141 AscendC prefill operators."""
+"""Kimi K3 integration coverage for the fused AscendC prefill operator."""
 
 import pytest
 import torch
@@ -55,8 +55,8 @@ def _naive_kda(
 @pytest.mark.skip_global_cleanup
 @torch.inference_mode()
 def test_kimi_k3_safe_gate_prefill_and_transposed_state_layout():
-    if not hasattr(torch.ops._C_ascend, "kda_gate_cumsum") or not hasattr(torch.ops._C_ascend, "chunk_kda_fwd"):
-        pytest.skip("requires the KDA AscendC operators from vllm-ascend PR #141")
+    if not hasattr(torch.ops._C_ascend, "chunk_kda_fwd"):
+        pytest.skip("requires the fused chunk KDA AscendC operator")
 
     torch.manual_seed(20260720)
     tokens, heads, head_dim = 64, 1, 128
@@ -64,7 +64,7 @@ def test_kimi_k3_safe_gate_prefill_and_transposed_state_layout():
     q = _l2norm(torch.randn(1, tokens, heads, head_dim, dtype=dtype, device="npu"))
     k = _l2norm(torch.randn_like(q))
     v = torch.randn_like(q) * 0.05
-    raw_gate = torch.randn_like(q) * 0.1
+    raw_gate = torch.randn(1, tokens, heads, head_dim, dtype=torch.float32, device="npu") * 0.1
     beta = torch.rand(1, tokens, heads, dtype=torch.float32, device="npu").sigmoid()
     a_log = torch.randn(heads, dtype=torch.float32, device="npu") * 0.05
     dt_bias = torch.randn(heads * head_dim, dtype=torch.float32, device="npu") * 0.05
@@ -73,32 +73,26 @@ def test_kimi_k3_safe_gate_prefill_and_transposed_state_layout():
     cu_seqlens = (0, tokens)
     chunk_indices = (0, 0)
 
-    gate_cumsum = torch.ops._C_ascend.kda_gate_cumsum(
-        raw_gate,
-        64,
-        A_log=a_log,
-        dt_bias=dt_bias,
-        cu_seqlens=cu_seqlens,
-        use_gate_in_kernel=True,
-        safe_gate=True,
-        lower_bound=lower_bound,
-        layout="BSND",
-    )
     initial_state_kv = cache_vk.transpose(-1, -2).contiguous()
     got = torch.ops._C_ascend.chunk_kda_fwd(
         q,
         k,
         v,
-        gate_cumsum,
+        raw_gate,
         beta,
         head_dim**-0.5,
         64,
         layout="BSND",
-        initial_state=initial_state_kv,
+        initial_state=cache_vk,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        return_intermediate=False,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        state_v_first=True,
     )
 
     safe_gate = lower_bound * torch.sigmoid(
@@ -107,7 +101,7 @@ def test_kimi_k3_safe_gate_prefill_and_transposed_state_layout():
     expected_out, expected_state_kv = _naive_kda(q, k, v, safe_gate, beta, initial_state_kv)
 
     torch.testing.assert_close(got[0], expected_out, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(got[1], expected_state_kv, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(got[1].transpose(-1, -2), expected_state_kv, rtol=3e-2, atol=3e-2)
     # The vLLM decode cache remains [H,V,K] after crossing the AscendC boundary.
-    cache_vk.copy_(got[1].transpose(-1, -2))
+    cache_vk.copy_(got[1])
     torch.testing.assert_close(cache_vk.transpose(-1, -2), expected_state_kv, rtol=3e-2, atol=3e-2)

@@ -181,38 +181,45 @@ def test_kda_torch_bindings_have_shape_correct_meta_kernels():
     v = torch.empty((1, 64, 2, 256), device="meta", dtype=torch.bfloat16)
     raw_gate = torch.empty((1, 64, 2, 128), device="meta", dtype=torch.bfloat16)
     beta = torch.empty((1, 64, 2), device="meta", dtype=torch.float32)
+    a_log = torch.empty((2,), device="meta", dtype=torch.float32)
+    dt_bias = torch.empty((2 * 128,), device="meta", dtype=torch.float32)
 
     gk = torch.ops._C_ascend.kda_gate_cumsum(raw_gate, 64, layout="BSND")
     outputs = torch.ops._C_ascend.chunk_kda_fwd(
         q,
         k,
         v,
-        gk,
+        raw_gate,
         beta,
         128**-0.5,
         64,
         layout="BSND",
         output_final_state=True,
-        return_intermediate=True,
+        safe_gate=True,
+        use_gate_in_kernel=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        disable_recompute=True,
+        return_intermediate_states=True,
     )
     swapped = torch.ops._C_ascend.kda_layout_swap12(raw_gate)
 
     assert gk.shape == raw_gate.shape
     assert gk.dtype == torch.float32
-    assert [tuple(output.shape) for output in outputs] == [
+    assert [tuple(output.shape) for output in outputs[:-1]] == [
         (1, 64, 2, 256),
         (1, 2, 128, 256),
-        (1, 64, 2, 128),
-        (1, 64, 2, 64),
-        (1, 64, 2, 64),
-        (1, 64, 2, 128),
-        (1, 64, 2, 256),
-        (1, 64, 2, 128),
-        (1, 64, 2, 128),
-        (1, 64, 2, 256),
+        (1, 2, 64, 128),
+        (1, 2, 64, 64),
+        (1, 2, 64, 64),
+        (1, 2, 64, 128),
+        (1, 2, 64, 256),
+        (1, 2, 64, 128),
+        (1, 2, 64, 128),
+        (1, 2, 64, 256),
         (1, 1, 2, 128, 256),
-        (0,),
     ]
+    assert outputs[11] is None
     assert outputs[0].dtype == torch.bfloat16
     assert outputs[1].dtype == torch.float32
     assert swapped.shape == (1, 2, 64, 128)
@@ -238,14 +245,15 @@ def test_chunk_kda_fwd_matches_reference_bsnd():
         q,
         k,
         v,
-        gk,
+        g,
         beta,
         scale,
         64,
         layout="BSND",
         initial_state=initial_state,
         output_final_state=True,
-        return_intermediate=True,
+        disable_recompute=True,
+        return_intermediate_states=True,
     )
     ref = chunk_kda_forward_reference(
         q.cpu(),
@@ -316,14 +324,15 @@ def test_chunk_kda_fwd_c128_v256_path(total_t, hq, hv, kdim, vdim, dtype):
             q,
             k,
             v,
-            gk,
+            g,
             beta,
             scale,
             64,
             layout="BSND",
             initial_state=initial_state,
             output_final_state=True,
-            return_intermediate=True,
+            disable_recompute=True,
+            return_intermediate_states=True,
         )
 
     is_a5_determinism_case = (
@@ -396,14 +405,15 @@ def test_chunk_kda_fwd_bnsd_layout_matches_reference():
         q_bnsd,
         k_bnsd,
         v_bnsd,
-        gk_bnsd,
+        g_bnsd,
         beta_bns,
         scale,
         64,
         layout="BNSD",
         initial_state=initial_state,
         output_final_state=True,
-        return_intermediate=True,
+        disable_recompute=True,
+        return_intermediate_states=True,
     )
     gk_bsnd = gk_bnsd.transpose(1, 2).contiguous()
     ref = chunk_kda_forward_reference(
@@ -418,7 +428,7 @@ def test_chunk_kda_fwd_bnsd_layout_matches_reference():
         output_final_state=True,
     )
 
-    out_bsnd = got[0].transpose(1, 2).contiguous()
+    out_bsnd = got[0]
     assert torch.isfinite(out_bsnd).all().item()
     assert torch.isfinite(got[1]).all().item()
     _assert_close("o", out_bsnd, ref.o)
