@@ -408,6 +408,49 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata
 
+    def _fold_spec_sized_prefill_chunks_into_spec(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        spec_sequence_masks_cpu: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Treat stateful ``num_spec + 1`` prefill chunks as spec rows.
+
+        Decode-graph dispatch is shape based, so a final prompt chunk with the
+        same width as a speculative decode row can replay a decode graph. Fold
+        the chunk into spec metadata and accept every token to advance its GDN
+        state over the complete chunk. A prompt's first chunk has no previous
+        state and remains on the prefill path.
+        """
+        is_prefilling = common_attn_metadata.is_prefilling
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+        if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
+            return spec_sequence_masks_cpu, num_accepted_tokens
+
+        num_reqs = min(
+            spec_sequence_masks_cpu.numel(),
+            is_prefilling.numel(),
+            seq_lens_cpu.numel(),
+        )
+        is_prefilling = is_prefilling[:num_reqs]
+        seq_lens_cpu = seq_lens_cpu[:num_reqs]
+        query_lens_cpu = torch.diff(common_attn_metadata.query_start_loc_cpu)[:num_reqs]
+        fold = (
+            is_prefilling
+            & ~spec_sequence_masks_cpu
+            & (query_lens_cpu == self.num_spec + 1)
+            & (seq_lens_cpu > query_lens_cpu)
+        )
+        fold_indices = fold.nonzero(as_tuple=True)[0]
+        if fold_indices.numel() == 0:
+            return spec_sequence_masks_cpu, num_accepted_tokens
+
+        spec_sequence_masks_cpu = spec_sequence_masks_cpu.clone()
+        spec_sequence_masks_cpu[fold_indices] = True
+        num_accepted_tokens = num_accepted_tokens.clone()
+        num_accepted_tokens[fold_indices.to(num_accepted_tokens.device)] = self.num_spec + 1
+        return spec_sequence_masks_cpu, num_accepted_tokens
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -443,6 +486,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_decode_draft_tokens_cpu,
                 0,
                 out=spec_sequence_masks_cpu,
+            )
+            spec_sequence_masks_cpu, num_accepted_tokens = self._fold_spec_sized_prefill_chunks_into_spec(
+                m,
+                spec_sequence_masks_cpu,
+                num_accepted_tokens,
             )
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0:

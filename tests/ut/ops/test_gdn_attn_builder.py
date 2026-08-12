@@ -483,6 +483,43 @@ def test_spec_conv1d_args_use_device_cache_and_accepted_tokens():
     )
 
 
+@pytest.mark.parametrize("seq_len", [389, 773])
+def test_stateful_384n_plus_5_prefill_is_folded_into_spec_decode(seq_len: int):
+    builder, _, attn_metadata = _build_attn_metadata(
+        BatchSpec(
+            seq_lens=[seq_len],
+            query_lens=[5],
+            name="stateful_384n_plus_5_prefill",
+        ),
+        num_speculative_tokens=4,
+        num_decode_draft_tokens_cpu=torch.tensor([-1], dtype=torch.int32),
+    )
+
+    assert builder.num_spec == 4
+    assert attn_metadata.num_prefills == 0
+    assert attn_metadata.num_spec_decodes == 1
+    assert attn_metadata.num_spec_decode_tokens == 5
+    assert torch.equal(attn_metadata.spec_sequence_masks, torch.tensor([True]))
+    assert torch.equal(attn_metadata.spec_query_start_loc, torch.tensor([0, 5], dtype=torch.int32))
+    assert torch.equal(attn_metadata.num_accepted_tokens, torch.tensor([5], dtype=torch.int32))
+
+
+def test_first_five_token_prefill_stays_on_prefill_path():
+    _, _, attn_metadata = _build_attn_metadata(
+        BatchSpec(
+            seq_lens=[5],
+            query_lens=[5],
+            name="first_five_token_prefill",
+        ),
+        num_speculative_tokens=4,
+        num_decode_draft_tokens_cpu=torch.tensor([-1], dtype=torch.int32),
+    )
+
+    assert attn_metadata.num_prefills == 1
+    assert attn_metadata.num_spec_decodes == 0
+    assert attn_metadata.spec_sequence_masks is None
+
+
 def test_full_graph_spec_conv1d_args_keep_request_granularity():
     batch_spec = BatchSpec(
         seq_lens=[4, 4, 4],
