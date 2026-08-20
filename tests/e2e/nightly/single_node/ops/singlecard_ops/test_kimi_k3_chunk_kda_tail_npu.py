@@ -32,6 +32,7 @@ _HEADS = 6
 _HEAD_DIM = 128
 _LOWER_BOUND = -5.0
 _MAX_REASONABLE_ABS = 1.0e6
+_TAIL_TEST_TOKENS = (128, 129, 130, 131, 143, 144, 145, 159, 160, 161, 191, 192, 193)
 _OUTPUT_NAMES = (
     "output",
     "final_state",
@@ -120,9 +121,10 @@ def _build_inputs(tokens: int) -> _ChunkKdaInputs:
     )
 
 
-def _run_chunk_kda(inputs: _ChunkKdaInputs, gate_mode: str):
+def _run_chunk_kda(inputs: _ChunkKdaInputs, gate_mode: str, metadata_mode: str):
     use_gate_in_kernel = gate_mode == "raw_gate"
     gate = inputs.raw_gate if use_gate_in_kernel else inputs.activated_gate
+    use_varlen_metadata = metadata_mode == "varlen"
     return torch.ops._C_ascend.chunk_kda_fwd(
         inputs.q,
         inputs.k,
@@ -134,8 +136,8 @@ def _run_chunk_kda(inputs: _ChunkKdaInputs, gate_mode: str):
         layout="BSND",
         initial_state=inputs.initial_state,
         output_final_state=True,
-        cu_seqlens=inputs.cu_seqlens,
-        chunk_indices=inputs.chunk_indices,
+        cu_seqlens=inputs.cu_seqlens if use_varlen_metadata else None,
+        chunk_indices=inputs.chunk_indices if use_varlen_metadata else None,
         safe_gate=True,
         lower_bound=_LOWER_BOUND,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -165,6 +167,29 @@ def _finite_max_abs(value: torch.Tensor) -> float:
     return value_fp64[finite].abs().max().item()
 
 
+def _first_differing_coordinate(first: torch.Tensor, second: torch.Tensor) -> tuple[int, ...] | None:
+    if first.shape != second.shape or first.dtype != second.dtype:
+        return None
+    different_bytes = first.view(torch.uint8).flatten() != second.view(torch.uint8).flatten()
+    positions = different_bytes.nonzero()
+    if not positions.numel():
+        return None
+
+    flat_index = int(positions[0].item()) // first.element_size()
+    coordinate = []
+    for dim in reversed(first.shape):
+        coordinate.append(flat_index % dim)
+        flat_index //= dim
+    return tuple(reversed(coordinate))
+
+
+def _differing_element_count(first: torch.Tensor, second: torch.Tensor) -> int:
+    if first.shape != second.shape or first.dtype != second.dtype:
+        return -1
+    different_bytes = first.view(torch.uint8).flatten() != second.view(torch.uint8).flatten()
+    return int(different_bytes.reshape(-1, first.element_size()).any(dim=1).sum().item())
+
+
 def _describe_difference(name: str, first: torch.Tensor | None, second: torch.Tensor | None) -> str | None:
     if first is None or second is None:
         return f"{name}: missing output first={type(first).__name__} second={type(second).__name__}"
@@ -186,25 +211,29 @@ def _describe_difference(name: str, first: torch.Tensor | None, second: torch.Te
         if finite_overlap.any().item()
         else float("nan")
     )
+    first_diff = _first_differing_coordinate(first, second)
+    first_value = first[first_diff].item() if first_diff is not None else None
+    second_value = second[first_diff].item() if first_diff is not None else None
     return (
         f"{name}: shape_first={tuple(first.shape)} shape_second={tuple(second.shape)} "
         f"dtype_first={first.dtype} dtype_second={second.dtype} "
         f"first_nonfinite={first_nonfinite} second_nonfinite={second_nonfinite} "
         f"first_bad_flat={_first_nonfinite_flat(first)} second_bad_flat={_first_nonfinite_flat(second)} "
         f"first_max_abs={first_max_abs:.8e} second_max_abs={second_max_abs:.8e} "
-        f"max_abs_diff={max_abs_diff:.8e}"
+        f"max_abs_diff={max_abs_diff:.8e} differing_elements={_differing_element_count(first, second)} "
+        f"first_diff_coordinate={first_diff} first_value={first_value} second_value={second_value}"
     )
 
 
 @pytest.mark.parametrize(
     "tokens",
-    [131, 128, 129, 130, 192, 193],
+    _TAIL_TEST_TOKENS,
     ids=lambda tokens: f"tokens_{tokens}_remainder_{tokens % _CHUNK_SIZE}",
 )
 @pytest.mark.parametrize("gate_mode", ["external_gate", "raw_gate"])
-@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("metadata_mode", ["dense", "varlen"])
 @torch.inference_mode()
-def test_kimi_k3_chunk_kda_bf16_tail_is_deterministic(tokens: int, gate_mode: str):
+def test_kimi_k3_chunk_kda_bf16_tail_is_deterministic(tokens: int, gate_mode: str, metadata_mode: str):
     if not hasattr(torch.ops._C_ascend, "chunk_kda_fwd"):
         pytest.skip("requires the fused chunk KDA AscendC operator")
 
@@ -213,8 +242,8 @@ def test_kimi_k3_chunk_kda_bf16_tail_is_deterministic(tokens: int, gate_mode: st
     # input boundary cannot contaminate the second invocation's tensors.
     first_inputs = inputs.clone()
     second_inputs = inputs.clone()
-    first = _snapshot_outputs(_run_chunk_kda(first_inputs, gate_mode))
-    second = _snapshot_outputs(_run_chunk_kda(second_inputs, gate_mode))
+    first = _snapshot_outputs(_run_chunk_kda(first_inputs, gate_mode, metadata_mode))
+    second = _snapshot_outputs(_run_chunk_kda(second_inputs, gate_mode, metadata_mode))
 
     problems = [
         problem
@@ -223,5 +252,6 @@ def test_kimi_k3_chunk_kda_bf16_tail_is_deterministic(tokens: int, gate_mode: st
     ]
     assert not problems, (
         f"Kimi-K3 chunk KDA is not deterministic for tokens={tokens}, "
-        f"remainder={tokens % _CHUNK_SIZE}, gate_mode={gate_mode}:\n" + "\n".join(problems)
+        f"remainder={tokens % _CHUNK_SIZE}, gate_mode={gate_mode}, metadata_mode={metadata_mode}:\n"
+        + "\n".join(problems)
     )
