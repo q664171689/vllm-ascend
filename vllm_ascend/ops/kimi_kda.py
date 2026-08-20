@@ -70,8 +70,61 @@ if HAS_TRITON:
 
 _KDA_CHUNK_SIZE = 64
 _KDA_AB_DEBUG_LAYER = 1
+_KDA_AB_RESULT_INDICES = (
+    ("gk", 2),
+    ("aqk", 3),
+    ("akk", 4),
+    ("qg", 7),
+    ("w", 5),
+    ("u", 6),
+    ("kg", 8),
+    ("v_new", 9),
+    ("h", 10),
+    ("final_state", 1),
+    ("output", 0),
+)
 _PACKED_CONV_WEIGHT_NAME = "packed_conv_weights"
 _FUSED_QKV_NAME = "fused_qkv"
+
+
+def _log_kda_tensor_stats(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    rank: int,
+    layer_idx: int,
+) -> None:
+    """Log finite-value statistics for one diagnostic KDA input."""
+    tensor_fp32 = tensor.float()
+    finite = torch.isfinite(tensor_fp32)
+    finite_count = int(finite.sum().item())
+    nonfinite_count = tensor.numel() - finite_count
+    if finite_count:
+        finite_min = torch.where(finite, tensor_fp32, torch.full_like(tensor_fp32, float("inf"))).min().item()
+        finite_max = torch.where(finite, tensor_fp32, torch.full_like(tensor_fp32, float("-inf"))).max().item()
+        finite_max_abs = torch.where(finite, tensor_fp32.abs(), torch.zeros_like(tensor_fp32)).max().item()
+    else:
+        finite_min = finite_max = finite_max_abs = float("nan")
+    logger.warning(
+        "KDA_AB_INPUT rank=%d layer=%d tensor=%s shape=%s dtype=%s "
+        "nonfinite=%d finite_min=%.8e finite_max=%.8e finite_max_abs=%.8e",
+        rank,
+        layer_idx,
+        name,
+        tuple(tensor.shape),
+        tensor.dtype,
+        nonfinite_count,
+        finite_min,
+        finite_max,
+        finite_max_abs,
+    )
+
+
+def _snapshot_kda_tensor(value: object) -> torch.Tensor | None:
+    """Copy an optional operator result to CPU before the next kernel runs."""
+    if not isinstance(value, torch.Tensor):
+        return None
+    return value.detach().cpu()
 
 
 def _log_kda_ab_diff(
@@ -83,23 +136,54 @@ def _log_kda_ab_diff(
     layer_idx: int,
 ) -> None:
     """Log numerical drift between the two chunk-KDA gate paths."""
-    internal_fp32 = internal.float()
-    external_fp32 = external.float()
-    abs_diff = (internal_fp32 - external_fp32).abs()
-    relative_l2 = torch.linalg.vector_norm(abs_diff) / torch.linalg.vector_norm(external_fp32).clamp_min(1e-12)
+    if internal.shape != external.shape:
+        logger.warning(
+            "KDA_AB rank=%d layer=%d tensor=%s shape_mismatch internal=%s external=%s",
+            rank,
+            layer_idx,
+            name,
+            tuple(internal.shape),
+            tuple(external.shape),
+        )
+        return
+
+    internal_fp64 = internal.double()
+    external_fp64 = external.double()
+    internal_finite = torch.isfinite(internal_fp64)
+    external_finite = torch.isfinite(external_fp64)
+    finite_overlap = internal_finite & external_finite
+    internal_nonfinite = internal.numel() - int(internal_finite.sum().item())
+    external_nonfinite = external.numel() - int(external_finite.sum().item())
+    bad_positions = (~finite_overlap).flatten().nonzero()
+    first_nonfinite = int(bad_positions[0].item()) if bad_positions.numel() else -1
+    finite_overlap_count = int(finite_overlap.sum().item())
+    if finite_overlap_count:
+        internal_values = internal_fp64[finite_overlap]
+        external_values = external_fp64[finite_overlap]
+        abs_diff = (internal_values - external_values).abs()
+        max_abs = abs_diff.max().item()
+        mean_abs = abs_diff.mean().item()
+        relative_l2 = (
+            torch.linalg.vector_norm(abs_diff) / torch.linalg.vector_norm(external_values).clamp_min(1e-12)
+        ).item()
+    else:
+        max_abs = mean_abs = relative_l2 = float("nan")
     logger.warning(
         "KDA_AB rank=%d layer=%d tensor=%s shape=%s dtype=%s "
-        "internal_finite=%s external_finite=%s max_abs=%.8e mean_abs=%.8e relative_l2=%.8e",
+        "internal_nonfinite=%d external_nonfinite=%d first_nonfinite_flat=%d "
+        "finite_overlap=%d max_abs=%.8e mean_abs=%.8e relative_l2=%.8e",
         rank,
         layer_idx,
         name,
         tuple(internal.shape),
         internal.dtype,
-        bool(torch.isfinite(internal_fp32).all().item()),
-        bool(torch.isfinite(external_fp32).all().item()),
-        abs_diff.max().item(),
-        abs_diff.mean().item(),
-        relative_l2.item(),
+        internal_nonfinite,
+        external_nonfinite,
+        first_nonfinite,
+        finite_overlap_count,
+        max_abs,
+        mean_abs,
+        relative_l2,
     )
 
 
@@ -534,41 +618,62 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 state_v_first=True,
             )
         else:
-            result = torch.ops._C_ascend.chunk_kda_fwd(
-                q,
-                k,
-                v.contiguous(),
-                raw_gate.contiguous(),
-                beta.contiguous(),
-                self.head_dim**-0.5,
-                _KDA_CHUNK_SIZE,
-                layout="BSND",
-                initial_state=initial_state_vk.clone(),
-                output_final_state=True,
-                cu_seqlens=cu_seqlens_ascendc,
-                chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
-                safe_gate=True,
-                lower_bound=lower_bound,
-                use_gate_in_kernel=True,
-                A_log=self.A_log.reshape(-1).contiguous(),
-                dt_bias=self.dt_bias.contiguous(),
-                disable_recompute=True,
-                return_intermediate_states=False,
-                state_v_first=True,
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            a_log = self.A_log.reshape(-1).contiguous().clone()
+            dt_bias = self.dt_bias.contiguous().clone()
+            # Prepare independent inputs before either custom-op invocation so
+            # an out-of-bounds write in one path cannot change the other path's
+            # input tensors.
+            q_external = q.clone()
+            q_internal = q.clone()
+            k_external = k.clone()
+            k_internal = k.clone()
+            v_contiguous = v.contiguous()
+            v_external = v_contiguous.clone()
+            v_internal = v_contiguous.clone()
+            beta_contiguous = beta.contiguous()
+            beta_external = beta_contiguous.clone()
+            beta_internal = beta_contiguous.clone()
+            raw_gate_external = raw_gate.contiguous().clone()
+            raw_gate_internal = raw_gate.contiguous().clone()
+            initial_state_external = initial_state_vk.clone()
+            initial_state_internal = initial_state_vk.clone()
+            activated_gate = lower_bound * torch.sigmoid(
+                (raw_gate_external.float() + dt_bias.reshape(1, 1, -1, self.head_dim).float())
+                * a_log.reshape(1, 1, -1, 1).float().exp()
             )
-            a_log = self.A_log.reshape(1, 1, -1, 1).float()
-            dt_bias = self.dt_bias.reshape(1, 1, -1, self.head_dim).float()
-            activated_gate = lower_bound * torch.sigmoid((raw_gate.float() + dt_bias) * a_log.exp())
+
+            for name, tensor in (
+                ("q", q),
+                ("k", k),
+                ("v", v),
+                ("raw_gate", raw_gate),
+                ("beta", beta),
+                ("A_log", a_log),
+                ("dt_bias", dt_bias),
+                ("activated_gate", activated_gate),
+                ("initial_state", initial_state_vk),
+            ):
+                _log_kda_tensor_stats(name, tensor, rank=rank, layer_idx=layer_idx)
+            logger.warning(
+                "KDA_AB_META rank=%d layer=%d chunk_size=%d cu_seqlens=%s chunk_indices=%s",
+                rank,
+                layer_idx,
+                _KDA_CHUNK_SIZE,
+                cu_seqlens_ascendc,
+                prebuilt_metadata.chunk_indices_chunk64_host,
+            )
+
             external_result = torch.ops._C_ascend.chunk_kda_fwd(
-                q,
-                k,
-                v.contiguous(),
+                q_external,
+                k_external,
+                v_external,
                 activated_gate.contiguous(),
-                beta.contiguous(),
+                beta_external,
                 self.head_dim**-0.5,
                 _KDA_CHUNK_SIZE,
                 layout="BSND",
-                initial_state=initial_state_vk.clone(),
+                initial_state=initial_state_external,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens_ascendc,
                 chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
@@ -581,19 +686,55 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 return_intermediate_states=False,
                 state_v_first=True,
             )
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            _log_kda_ab_diff("output", result[0], external_result[0], rank=rank, layer_idx=layer_idx)
-            _log_kda_ab_diff("final_state", result[1], external_result[1], rank=rank, layer_idx=layer_idx)
-            if isinstance(result[2], torch.Tensor) and isinstance(external_result[2], torch.Tensor):
-                _log_kda_ab_diff("gk", result[2], external_result[2], rank=rank, layer_idx=layer_idx)
-            else:
-                logger.warning(
-                    "KDA_AB rank=%d layer=%d tensor=gk unavailable internal=%s external=%s",
-                    rank,
-                    layer_idx,
-                    type(result[2]).__name__,
-                    type(external_result[2]).__name__,
-                )
+            # Snapshot the reference on CPU before running the suspect path.
+            # This also synchronizes the external invocation and protects the
+            # reference from device-memory corruption by the internal path.
+            external_snapshots = {
+                index: _snapshot_kda_tensor(external_result[index]) for _, index in _KDA_AB_RESULT_INDICES
+            }
+
+            result = torch.ops._C_ascend.chunk_kda_fwd(
+                q_internal,
+                k_internal,
+                v_internal,
+                raw_gate_internal,
+                beta_internal,
+                self.head_dim**-0.5,
+                _KDA_CHUNK_SIZE,
+                layout="BSND",
+                initial_state=initial_state_internal,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens_ascendc,
+                chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
+                safe_gate=True,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                disable_recompute=True,
+                return_intermediate_states=False,
+                state_v_first=True,
+            )
+            for name, index in _KDA_AB_RESULT_INDICES:
+                internal_snapshot = _snapshot_kda_tensor(result[index])
+                external_snapshot = external_snapshots[index]
+                if internal_snapshot is not None and external_snapshot is not None:
+                    _log_kda_ab_diff(
+                        name,
+                        internal_snapshot,
+                        external_snapshot,
+                        rank=rank,
+                        layer_idx=layer_idx,
+                    )
+                else:
+                    logger.warning(
+                        "KDA_AB rank=%d layer=%d tensor=%s unavailable internal=%s external=%s",
+                        rank,
+                        layer_idx,
+                        name,
+                        type(result[index]).__name__,
+                        type(external_result[index]).__name__,
+                    )
             self._kda_ab_debug_done = True
         recurrent_state[state_indices] = result[1].to(recurrent_state.dtype)
         return result[0]
