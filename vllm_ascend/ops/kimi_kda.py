@@ -24,6 +24,8 @@ through the recurrent KDA AscendC kernel.
 
 from collections.abc import Callable
 from functools import partial, wraps
+from pathlib import Path
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -68,6 +70,33 @@ if HAS_TRITON:
 _KDA_CHUNK_SIZE = 64
 _PACKED_CONV_WEIGHT_NAME = "packed_conv_weights"
 _FUSED_QKV_NAME = "fused_qkv"
+_KDA_DUMP_CONFIG_KEY = "kimi_kda_tensor_dump"
+_KDA_OUTPUT_NAMES = (
+    "attn_out",
+    "final_state",
+    "gk",
+    "aqk",
+    "akk",
+    "w",
+    "u",
+    "qg",
+    "kg",
+    "v_new",
+    "h",
+    "initial_state",
+)
+
+
+def _move_dump_value_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, tuple):
+        return tuple(_move_dump_value_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_move_dump_value_to_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_dump_value_to_cpu(item) for key, item in value.items()}
+    return value
 
 
 def _zero_padded_spec_output(
@@ -188,6 +217,24 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         del self.k_proj
         del self.v_proj
         self.fused_qkv = fused_qkv
+
+        additional_config = vllm_config.additional_config or {}
+        dump_config = additional_config.get(_KDA_DUMP_CONFIG_KEY)
+        if dump_config is not None and not isinstance(dump_config, dict):
+            raise ValueError(f"additional_config.{_KDA_DUMP_CONFIG_KEY} must be a dictionary.")
+        dump_config = dump_config or {}
+        dump_path = dump_config.get("path")
+        if dump_path is not None and not isinstance(dump_path, str):
+            raise ValueError(f"additional_config.{_KDA_DUMP_CONFIG_KEY}.path must be a string.")
+        if dump_path and "layer" not in dump_config:
+            raise ValueError(f"additional_config.{_KDA_DUMP_CONFIG_KEY}.layer is required when dumping is enabled.")
+        self._kda_dump_dir = Path(dump_path) if dump_path else None
+        self._kda_dump_rank = int(dump_config.get("rank", 0))
+        self._kda_dump_layer = int(dump_config.get("layer", -1))
+        self._kda_dump_max_calls = int(dump_config.get("max_calls", 1))
+        if self._kda_dump_max_calls <= 0:
+            raise ValueError(f"additional_config.{_KDA_DUMP_CONFIG_KEY}.max_calls must be positive.")
+        self._kda_dump_count = 0
 
         self.A_log.weight_loader = partial(
             _load_a_log,
@@ -387,6 +434,23 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
     def _conv_weights_t(self) -> torch.Tensor:
         return self.q_conv1d.get_parameter(_PACKED_CONV_WEIGHT_NAME)
 
+    def _should_dump_chunk_kda(self) -> bool:
+        if self._kda_dump_dir is None or self._kda_dump_count >= self._kda_dump_max_calls:
+            return False
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return global_rank == self._kda_dump_rank and parse_layer_idx(self.prefix) == self._kda_dump_layer
+
+    def _dump_chunk_kda_tensors(self, kind: str, payload: dict[str, Any]) -> None:
+        assert self._kda_dump_dir is not None
+        self._kda_dump_dir.mkdir(parents=True, exist_ok=True)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        layer_idx = parse_layer_idx(self.prefix)
+        dump_file = self._kda_dump_dir / (
+            f"chunk_kda_rank{global_rank}_layer{layer_idx}_call{self._kda_dump_count}_{kind}.pt"
+        )
+        torch.npu.synchronize()
+        torch.save(_move_dump_value_to_cpu(payload), dump_file)
+
     def _run_recurrent(
         self,
         q: torch.Tensor,
@@ -469,28 +533,70 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
+        v_input = v.contiguous()
+        gate_input = raw_gate.contiguous()
+        beta_input = beta.contiguous()
+        a_log_input = self.A_log.reshape(-1).contiguous()
+        dt_bias_input = self.dt_bias.contiguous()
+        chunk_indices = prebuilt_metadata.chunk_indices_chunk64_host
+        scale = self.head_dim**-0.5
+        lower_bound = self.gate_lower_bound if self.gate_lower_bound is not None else -5.0
+        dump_this_call = self._should_dump_chunk_kda()
+        if dump_this_call:
+            self._dump_chunk_kda_tensors(
+                "input",
+                {
+                    "q": q,
+                    "k": k,
+                    "v": v_input,
+                    "g": gate_input,
+                    "beta": beta_input,
+                    "scale": scale,
+                    "chunk_size": _KDA_CHUNK_SIZE,
+                    "layout": "BSND",
+                    "initial_state": initial_state_vk,
+                    "output_final_state": True,
+                    "cu_seqlens": cu_seqlens_ascendc,
+                    "chunk_indices": chunk_indices,
+                    "safe_gate": self.gate_lower_bound is not None,
+                    "lower_bound": lower_bound,
+                    "use_gate_in_kernel": True,
+                    "A_log": a_log_input,
+                    "dt_bias": dt_bias_input,
+                    "disable_recompute": False,
+                    "return_intermediate_states": False,
+                    "state_v_first": True,
+                },
+            )
+
         result = torch.ops._C_ascend.chunk_kda_fwd(
             q,
             k,
-            v.contiguous(),
-            raw_gate.contiguous(),
-            beta.contiguous(),
-            self.head_dim**-0.5,
+            v_input,
+            gate_input,
+            beta_input,
+            scale,
             _KDA_CHUNK_SIZE,
             layout="BSND",
             initial_state=initial_state_vk,
             output_final_state=True,
             cu_seqlens=cu_seqlens_ascendc,
-            chunk_indices=prebuilt_metadata.chunk_indices_chunk64_host,
+            chunk_indices=chunk_indices,
             safe_gate=self.gate_lower_bound is not None,
-            lower_bound=self.gate_lower_bound if self.gate_lower_bound is not None else -5.0,
+            lower_bound=lower_bound,
             use_gate_in_kernel=True,
-            A_log=self.A_log.reshape(-1).contiguous(),
-            dt_bias=self.dt_bias.contiguous(),
+            A_log=a_log_input,
+            dt_bias=dt_bias_input,
             disable_recompute=False,
             return_intermediate_states=False,
             state_v_first=True,
         )
+        if dump_this_call:
+            self._dump_chunk_kda_tensors(
+                "output",
+                dict(zip(_KDA_OUTPUT_NAMES, result, strict=True)),
+            )
+            self._kda_dump_count += 1
         recurrent_state[state_indices] = result[1].to(recurrent_state.dtype)
         return result[0]
 
