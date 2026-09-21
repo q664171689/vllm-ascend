@@ -144,7 +144,6 @@ benchmarks:
     dataset_path: vllm-ascend/gpqa
     request_conf: vllm_api_general_chat
     dataset_conf: gpqa/gpqa_gen_0_shot_cot_chat_prompt
-    num_prompts: 64
     max_out_len: 65536
     batch_size: 32
     temperature: 1.0
