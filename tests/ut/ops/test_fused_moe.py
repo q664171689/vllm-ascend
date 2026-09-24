@@ -2419,7 +2419,7 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     assert result[1] is routed_out
 
 
-def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None):
+def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None, shared_experts_cls=None):
     """Construct AscendMoERunner with a lightweight MoERunner.__init__ stub."""
     moe_config = SimpleNamespace(hidden_dim=4, ep_size=1)
     routed_experts = SimpleNamespace(
@@ -2469,6 +2469,7 @@ def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None):
         routed_experts=routed_experts,
         gate=gate,
         shared_experts=shared_experts,
+        shared_experts_cls=shared_experts_cls,
     )
 
 
@@ -2493,6 +2494,26 @@ def test_runner_skips_precast_when_weight_fp32_already_exists(monkeypatch):
 def test_runner_skips_precast_without_internal_router(monkeypatch):
     runner = _stub_moe_runner_init(monkeypatch, gate=None)
     assert runner._gate is None
+
+
+def test_runner_accepts_shared_expert_executor_override(monkeypatch):
+    executor = SimpleNamespace()
+    executor_cls = MagicMock(return_value=executor)
+    shared_layer = SimpleNamespace()
+
+    runner = _stub_moe_runner_init(
+        monkeypatch,
+        shared_experts=shared_layer,
+        shared_experts_cls=executor_cls,
+    )
+
+    assert runner.ascend_shared_experts is executor
+    executor_cls.assert_called_once_with(
+        shared_layer,
+        runner.moe_config,
+        runner.quant_type,
+        runner._quant_method,
+    )
 
 
 def test_forward_impl_uses_gate_weight_fp32(monkeypatch):

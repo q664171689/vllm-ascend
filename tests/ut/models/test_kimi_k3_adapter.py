@@ -21,6 +21,93 @@ from vllm_ascend.models.kimi_k3_dspark import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 
 
+def _kimi_shared_expert_quant_description(shared_prefix: str) -> dict[str, object]:
+    return {
+        "group_size": 0,
+        "version": "1.0.0",
+        **{f"{shared_prefix}.{name}.weight": "W4A8_DYNAMIC" for name in ("gate_proj", "up_proj", "down_proj")},
+    }
+
+
+def test_kimi_scopes_w4a8_linear_selection_to_shared_experts():
+    shared_prefix = "language_model.model.layers.1.block_sparse_moe.shared_experts"
+    quant_description = _kimi_shared_expert_quant_description(shared_prefix)
+    base = kimi_k3.AscendModelSlimConfig(quant_description)
+
+    assert kimi_k3._uses_w4a8_shared_expert_linears(base, shared_prefix)
+
+    config = kimi_k3._KimiSharedExpertW4A8Config(base, shared_prefix)
+    layer = MagicMock(spec=kimi_k3.LinearBase)
+    vllm_config = MagicMock()
+    vllm_config.quant_config.quant_description = quant_description
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.w4a8.w4a8.get_current_vllm_config",
+            return_value=vllm_config,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.w4a8.w4a8.get_tensor_model_parallel_world_size",
+            return_value=16,
+        ),
+    ):
+        method = config.get_quant_method(layer, f"{shared_prefix}.gate_up_proj")
+
+    assert isinstance(method, kimi_k3.AscendLinearMethod)
+    assert isinstance(method.quant_method, kimi_k3.AscendKimiK3W4A8DynamicLinearMethod)
+
+
+def test_kimi_w4a8_shared_expert_uses_model_local_executor():
+    shared_mlp = kimi_k3.AscendKimiW4A8SharedMLP.__new__(kimi_k3.AscendKimiW4A8SharedMLP)
+    shared_experts = kimi_k3.AscendKimiSharedExperts.__new__(kimi_k3.AscendKimiSharedExperts)
+    shared_experts.layer = shared_mlp
+
+    assert shared_experts._select_mlp_path() is kimi_k3.SharedExpertMLPPath.LINEAR_WRAPPER
+
+
+def test_kimi_moe_injects_w4a8_config_and_shared_executor(monkeypatch):
+    shared_prefix = "language_model.model.layers.1.block_sparse_moe.shared_experts"
+    quant_config = kimi_k3.AscendModelSlimConfig(_kimi_shared_expert_quant_description(shared_prefix))
+    config = SimpleNamespace(
+        hidden_size=8,
+        moe_intermediate_size=4,
+        num_experts=2,
+        num_experts_per_token=1,
+        routed_expert_hidden_size=None,
+        latent_moe_use_norm=False,
+        routed_scaling_factor=1.0,
+        num_shared_experts=1,
+        hidden_act="silu",
+        moe_renormalize=True,
+        use_grouped_topk=False,
+        num_expert_group=None,
+        topk_group=None,
+        moe_router_activation_func="softmax",
+    )
+    captured = {}
+
+    def init_shared_mlp(module, **kwargs):
+        nn.Module.__init__(module)
+        captured.update(kwargs)
+
+    gate = nn.Module()
+    factory = MagicMock(return_value=nn.Identity())
+    monkeypatch.setattr(kimi_k3, "GateLinear", MagicMock(return_value=gate))
+    monkeypatch.setattr(kimi_k3.AscendKimiW4A8SharedMLP, "__init__", init_shared_mlp)
+    monkeypatch.setattr(kimi_k3, "FusedMoEFactory", factory)
+
+    moe = kimi_k3.AscendKimiMoE(
+        config=config,
+        quant_config=quant_config,
+        prefix="language_model.model.layers.1.block_sparse_moe",
+    )
+
+    assert isinstance(moe.shared_experts, kimi_k3.AscendKimiW4A8SharedMLP)
+    assert isinstance(captured["quant_config"], kimi_k3._KimiSharedExpertW4A8Config)
+    assert factory.call_args.kwargs["runner_args"] == {
+        "shared_experts_cls": kimi_k3.AscendKimiSharedExperts,
+    }
+
+
 def test_kimi_disabling_mlapo_refreshes_projection_nz_management():
     for fa_quant_layer in (False, True):
         impl = AscendMLAImpl.__new__(AscendMLAImpl)

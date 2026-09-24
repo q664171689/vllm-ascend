@@ -9,6 +9,7 @@ the generic MLA/MoE implementation and the Ascend KDA backend.
 
 import math
 from copy import copy
+from typing import Any
 
 import torch
 import vllm.envs as envs
@@ -23,10 +24,12 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    LinearBase,
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -79,7 +82,16 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
+from vllm_ascend.ops.fused_moe.shared_experts import (
+    AscendSharedExperts,
+    SharedExpertMLPPath,
+)
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
+from vllm_ascend.quantization.configs.modelslim_config import (
+    AscendModelSlimConfig,
+)
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendKimiK3W4A8DynamicLinearMethod
 from vllm_ascend.utils import get_rotation_path
 
 if HAS_TRITON:
@@ -124,6 +136,78 @@ def _apply_ascend_attn_res(
     scores = (normalized_without_gamma * score_weight).sum(-1)
     probabilities = scores.softmax(-1).unsqueeze(1)
     return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
+
+
+class _KimiSharedExpertW4A8Config(QuantizationConfig):
+    """Select Kimi's W4A8 linear method only for one shared-expert MLP."""
+
+    def __init__(self, base: AscendModelSlimConfig, shared_expert_prefix: str) -> None:
+        super().__init__()
+        self.base = base
+        self.linear_prefixes = frozenset(
+            {
+                f"{shared_expert_prefix}.gate_up_proj",
+                f"{shared_expert_prefix}.down_proj",
+            }
+        )
+        self.packed_modules_mapping = base.packed_modules_mapping
+        self.online_quantization_config = base.online_quantization_config
+
+    @classmethod
+    def get_name(cls) -> str:
+        return AscendModelSlimConfig.get_name()
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return AscendModelSlimConfig.get_supported_act_dtypes()
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return AscendModelSlimConfig.get_min_capability()
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return AscendModelSlimConfig.get_config_filenames()
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "_KimiSharedExpertW4A8Config":
+        del config
+        raise TypeError("Kimi's shared-expert quantization config must wrap an AscendModelSlimConfig")
+
+    def get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+        tid2eid=None,
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, LinearBase) and prefix in self.linear_prefixes:
+            return AscendLinearMethod(AscendKimiK3W4A8DynamicLinearMethod())
+        return self.base.get_quant_method(layer, prefix, tid2eid)
+
+
+def _uses_w4a8_shared_expert_linears(
+    quant_config: QuantizationConfig | None,
+    shared_expert_prefix: str,
+) -> bool:
+    if not isinstance(quant_config, AscendModelSlimConfig):
+        return False
+    return all(
+        quant_config.quant_description.get(f"{shared_expert_prefix}.{projection}.weight") == "W4A8_DYNAMIC"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    )
+
+
+class AscendKimiW4A8SharedMLP(KimiMLP):
+    """Identify the Kimi shared MLP that requires its registered linear wrappers."""
+
+
+class AscendKimiSharedExperts(AscendSharedExperts):
+    """Keep Kimi's W4A8 shared projections on their grouped-linear kernels."""
+
+    def _select_mlp_path(self) -> SharedExpertMLPPath:
+        if isinstance(self.layer, AscendKimiW4A8SharedMLP):
+            return SharedExpertMLPPath.LINEAR_WRAPPER
+        return super()._select_mlp_path()
 
 
 class AscendKimiMLP(KimiMLP):
@@ -203,13 +287,24 @@ class AscendKimiMoE(nn.Module):
         self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
 
         if self.num_shared_experts is not None:
-            self.shared_experts = KimiMLP(
+            shared_expert_prefix = f"{prefix}.shared_experts"
+            uses_w4a8_shared_experts = _uses_w4a8_shared_expert_linears(
+                quant_config,
+                shared_expert_prefix,
+            )
+            shared_expert_cls = AscendKimiW4A8SharedMLP if uses_w4a8_shared_experts else KimiMLP
+            shared_expert_quant_config = (
+                _KimiSharedExpertW4A8Config(quant_config, shared_expert_prefix)
+                if uses_w4a8_shared_experts and isinstance(quant_config, AscendModelSlimConfig)
+                else quant_config
+            )
+            self.shared_experts = shared_expert_cls(
                 hidden_size=hidden_size,
                 intermediate_size=moe_intermediate_size * self.num_shared_experts,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=shared_expert_quant_config,
                 reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
+                prefix=shared_expert_prefix,
                 activation_situ_beta=activation_situ_beta,
                 activation_situ_linear_beta=activation_situ_linear_beta,
             )
@@ -266,6 +361,7 @@ class AscendKimiMoE(nn.Module):
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=self.routed_output_transform,
             is_sequence_parallel=use_sequence_parallel,
+            runner_args={"shared_experts_cls": AscendKimiSharedExperts},
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

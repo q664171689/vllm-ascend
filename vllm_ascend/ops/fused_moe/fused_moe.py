@@ -93,6 +93,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         routed_input_transform=None,
         routed_output_transform=None,
         routed_scaling_factor=1,
+        shared_experts_cls: type[AscendSharedExperts] | None = None,
     ):
         super().__init__(
             layer_name,
@@ -127,7 +128,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.ascend_shared_experts = None
         if shared_experts is not None:
             routed_experts.return_with_event = True
-            self.ascend_shared_experts = AscendSharedExperts(
+            shared_experts_cls = shared_experts_cls or AscendSharedExperts
+            self.ascend_shared_experts = shared_experts_cls(
                 shared_experts,
                 self.moe_config,
                 self.quant_type,
