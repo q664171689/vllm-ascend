@@ -16,8 +16,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
+
+
+class SharedExpertA8Backend(Protocol):
+    """Optional split A8 computation; streams and collectives stay in the executor.
+
+    A linear scheme may provide ``create_shared_expert_a8_backend(layer)``.
+    It must validate both projections and the activation, returning ``None``
+    to use the linear wrappers when the combination cannot be fused. Backends
+    retain layer references, not weight tensors captured before weight loading.
+    """
+
+    def gate_up(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Project dynamically quantized input without quantizing it again."""
+        ...
+
+    def activation_quant(self, gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the activation and return quantized values and token scales."""
+        ...
+
+    def down(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Project quantized activations without adding output collectives."""
+        ...
 
 
 @dataclass

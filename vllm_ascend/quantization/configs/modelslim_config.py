@@ -647,6 +647,17 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
+            if (
+                model_type in ("kimi_k3", "kimi_linear")
+                and ".shared_experts." in prefix
+                and quant_type == "W4A8_DYNAMIC"
+            ):
+                # W4A8 linear is intentionally not registered globally. Kimi K3
+                # checkpoints still use it for shared experts, which execute as
+                # a single grouped expert on Ascend.
+                from ..methods.w4a8 import AscendKimiK3W4A8DynamicLinearMethod
+
+                return AscendLinearMethod(AscendKimiK3W4A8DynamicLinearMethod())
             scheme = create_scheme_for_layer(quant_type, prefix, "linear")
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)

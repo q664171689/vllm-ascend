@@ -32,12 +32,25 @@ from vllm_ascend.lora.fused_moe import has_lora
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     PreparedSharedExpertInput,
     RoutedMoEMilestones,
+    SharedExpertA8Backend,
 )
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
+
+
+def _create_shared_expert_a8_backend(layer: torch.nn.Module) -> tuple[bool, SharedExpertA8Backend | None]:
+    # Check either projection so a partially supported pair cannot fall through
+    # to a built-in fused path whose weight layout may be incompatible.
+    for projection in (layer.gate_up_proj, layer.down_proj):
+        linear_method = getattr(projection, "quant_method", None)
+        scheme = getattr(linear_method, "quant_method", None)
+        factory = getattr(type(scheme), "create_shared_expert_a8_backend", None)
+        if factory is not None:
+            return True, factory(scheme, layer)
+    return False, None
 
 
 class SharedExpertParallelMode(Enum):
@@ -54,6 +67,7 @@ class SharedExpertMLPPath(Enum):
 
     A8_INT_FUSED = auto()  # W8A8/W4A8: explicit A8 quant + fused activation quant.
     A8_MXFP_FUSED = auto()  # W4A8MXFP: explicit MXFP8 activation pipeline.
+    A8_BACKEND = auto()  # Scheme-provided computation with the same staged scheduling.
     LINEAR_WRAPPER = auto()  # Dense, other quant schemes, or any active LoRA.
 
 
@@ -64,6 +78,9 @@ class AscendSharedExperts:
     for checkpoint compatibility while moving split/overlap execution details
     out of the runner.
     """
+
+    _has_a8_backend_provider: bool = False
+    _a8_backend: SharedExpertA8Backend | None = None
 
     def __init__(
         self,
@@ -91,6 +108,7 @@ class AscendSharedExperts:
         ascend_config = get_ascend_config()
         self.multistream_overlap = ascend_config.multistream_overlap_shared_expert
         self.weights_replicated = ascend_config.enable_shared_expert_dp
+        self._has_a8_backend_provider, self._a8_backend = _create_shared_expert_a8_backend(layer)
 
         if self.multistream_overlap:
             # Wrap the quant_method's process_weights_after_loading to validate that
@@ -497,6 +515,24 @@ class AscendSharedExperts:
         )
         return self.part2(hidden_states, shared_act)
 
+    def _run_a8_backend_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        milestones: RoutedMoEMilestones,
+        down_projection_ready: torch.npu.Event | None,
+        down_projection_milestone: str,
+    ) -> torch.Tensor:
+        backend = self._a8_backend
+        assert backend is not None
+        # Preserve early input quantization and all three overlap boundaries.
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        self._wait_for_milestone(milestones.router_output_ready, "router_output_ready")
+        gate_up = backend.gate_up(quantized_x, pertoken_scale)
+        self._wait_for_routed_stage(milestones, milestones.routed_gmm2_start, "routed_gmm2_start")
+        quantized_act, act_scale = backend.activation_quant(gate_up)
+        self._wait_for_routed_stage(milestones, down_projection_ready, down_projection_milestone)
+        return backend.down(quantized_act, act_scale)
+
     def _run_shared_mlp(
         self,
         hidden_states: torch.Tensor,
@@ -508,6 +544,13 @@ class AscendSharedExperts:
         down_projection_milestone = "routed_combine_start"
 
         path = self._select_mlp_path()
+        if path is SharedExpertMLPPath.A8_BACKEND:
+            return self._run_a8_backend_mlp(
+                hidden_states,
+                milestones,
+                down_projection_ready,
+                down_projection_milestone,
+            )
         if path is SharedExpertMLPPath.A8_INT_FUSED:
             return self._run_a8_int_mlp(
                 hidden_states,
@@ -537,6 +580,10 @@ class AscendSharedExperts:
         schemes continue through those wrappers.  Active LoRA always needs the
         wrapper path so its adapter computation is preserved.
         """
+        if self._has_a8_backend_provider:
+            if self._a8_backend is not None and not has_lora(self.lora_context):
+                return SharedExpertMLPPath.A8_BACKEND
+            return SharedExpertMLPPath.LINEAR_WRAPPER
         has_quantized_shared_without_lora = (
             not has_lora(self.lora_context)
             and hasattr(self.layer.gate_up_proj, "weight_scale")
