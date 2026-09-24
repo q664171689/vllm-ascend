@@ -1139,6 +1139,21 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     assert shared_experts._select_mlp_path() is expected_path
 
 
+def test_shared_expert_scheme_can_require_linear_wrapper(monkeypatch):
+    scheme = SimpleNamespace(requires_shared_expert_linear_wrapper=True)
+    projection = SimpleNamespace(
+        quant_method=SimpleNamespace(quant_method=scheme),
+        weight_scale=torch.ones(1),
+    )
+    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts.layer = SimpleNamespace(gate_up_proj=projection, down_proj=projection)
+    shared_experts.quant_type = QuantType.W4A8
+    shared_experts.lora_context = None
+    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
+
+    assert shared_experts._select_mlp_path() is SharedExpertMLPPath.LINEAR_WRAPPER
+
+
 def test_multistream_missing_required_milestone_fails_fast():
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
     shared_experts.multistream_overlap = True

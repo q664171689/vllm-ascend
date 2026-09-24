@@ -40,6 +40,12 @@ from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stre
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
+def _requires_shared_expert_linear_wrapper(projection: torch.nn.Module) -> bool:
+    linear_method = getattr(projection, "quant_method", None)
+    scheme = getattr(linear_method, "quant_method", None)
+    return getattr(scheme, "requires_shared_expert_linear_wrapper", False) is True
+
+
 class SharedExpertParallelMode(Enum):
     """Effective activation and weight layout for a shared-expert forward."""
 
@@ -537,6 +543,11 @@ class AscendSharedExperts:
         schemes continue through those wrappers.  Active LoRA always needs the
         wrapper path so its adapter computation is preserved.
         """
+        if any(
+            _requires_shared_expert_linear_wrapper(projection)
+            for projection in (self.layer.gate_up_proj, self.layer.down_proj)
+        ):
+            return SharedExpertMLPPath.LINEAR_WRAPPER
         has_quantized_shared_without_lora = (
             not has_lora(self.lora_context)
             and hasattr(self.layer.gate_up_proj, "weight_scale")
